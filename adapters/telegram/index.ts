@@ -249,7 +249,7 @@ async function flushToTelegram(chatId: string, newText: string, isComplete: bool
     patienceTimers.delete(chatId)
     placeholders.delete(chatId)
     accumulatedText.delete(chatId)
-    thinkingCount.delete(chatId)
+    // 注意：不刪 thinkingCount — 讓它在整個回應過程中持續累計
     buffers.get(chatId)?.reset()
   }
 }
@@ -427,7 +427,7 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
           }
           placeholders.delete(chatId)
           accumulatedText.delete(chatId)
-          thinkingCount.delete(chatId)
+          // 不刪 thinkingCount — 讓它在整個回應過程中持續累計
           clearTimeout(patienceTimers.get(chatId))
           patienceTimers.delete(chatId)
           buffers.get(chatId)?.reset()
