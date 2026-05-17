@@ -389,19 +389,25 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
           const sent = await bot.api.sendMessage(numericChatId, '💭 思考中...')
           placeholders.set(chatId, { chatId, messageId: sent.message_id })
           accumulatedText.set(chatId, '')
-          // 20秒後更新為「請耐心等候」，讓使用者知道還有在跑
+          // 10秒 → 還在思考中；20秒 → 請耐心等候
           clearTimeout(patienceTimers.get(chatId))
-          patienceTimers.set(
-            chatId,
-            setTimeout(async () => {
-              const ph = placeholders.get(chatId)
-              if (ph) {
-                try {
-                  await bot.api.editMessageText(numericChatId, ph.messageId, '💭 請耐心等候，可能需要較長時間思考...')
-                } catch { /* ignore */ }
-              }
-            }, 20000),
-          )
+          let elapsed = 0
+          const updatePatience = () => {
+            elapsed += 10
+            const ph = placeholders.get(chatId)
+            if (!ph) return
+            const messages: Record<number, string> = {
+              10: '💭 還在思考中...',
+              20: '💭 請耐心等候，可能需要較長時間思考...',
+            }
+            if (messages[elapsed]) {
+              bot.api.editMessageText(numericChatId, ph.messageId, messages[elapsed]!).catch(() => {})
+            }
+            if (elapsed < 20) {
+              patienceTimers.set(chatId, setTimeout(updatePatience, 10000))
+            }
+          }
+          patienceTimers.set(chatId, setTimeout(updatePatience, 10000))
         }
       }
       break
