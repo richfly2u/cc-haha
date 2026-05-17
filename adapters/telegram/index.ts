@@ -62,6 +62,8 @@ attachmentStore.gc().catch((err) => {
 const placeholders = new Map<string, { chatId: string; messageId: number }>()
 // Track thinking message count per chat (for varied thinking messages)
 const thinkingCount = new Map<string, number>()
+// 20秒耐心等候定時器，避免使用者以為機器人沒在動
+const patienceTimers = new Map<string, ReturnType<typeof setTimeout>>()
 // Track accumulated text per chat for streaming
 const accumulatedText = new Map<string, string>()
 // Message buffers per chat
@@ -243,6 +245,8 @@ async function flushToTelegram(chatId: string, newText: string, isComplete: bool
   }
 
   if (isComplete) {
+    clearTimeout(patienceTimers.get(chatId))
+    patienceTimers.delete(chatId)
     placeholders.delete(chatId)
     accumulatedText.delete(chatId)
     thinkingCount.delete(chatId)
@@ -385,6 +389,19 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
           const sent = await bot.api.sendMessage(numericChatId, '💭 思考中...')
           placeholders.set(chatId, { chatId, messageId: sent.message_id })
           accumulatedText.set(chatId, '')
+          // 20秒後更新為「請耐心等候」，讓使用者知道還有在跑
+          clearTimeout(patienceTimers.get(chatId))
+          patienceTimers.set(
+            chatId,
+            setTimeout(async () => {
+              const ph = placeholders.get(chatId)
+              if (ph) {
+                try {
+                  await bot.api.editMessageText(numericChatId, ph.messageId, '💭 請耐心等候，可能需要較長時間思考...')
+                } catch { /* ignore */ }
+              }
+            }, 20000),
+          )
         }
       }
       break
@@ -411,6 +428,8 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
           placeholders.delete(chatId)
           accumulatedText.delete(chatId)
           thinkingCount.delete(chatId)
+          clearTimeout(patienceTimers.get(chatId))
+          patienceTimers.delete(chatId)
           buffers.get(chatId)?.reset()
         }
       }
@@ -482,6 +501,8 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
         placeholders.delete(chatId)
         accumulatedText.delete(chatId)
         thinkingCount.delete(chatId)
+        clearTimeout(patienceTimers.get(chatId))
+        patienceTimers.delete(chatId)
         buffers.get(chatId)?.reset()
       }
       break
