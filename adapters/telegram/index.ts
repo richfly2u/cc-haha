@@ -729,8 +729,14 @@ async function routeUserMessage(
   text: string,
   attachments: AttachmentRef[],
 ): Promise<void> {
-  if (!ctx.from) return
-  if (ctx.chat?.type !== 'private' && !shouldProcessMessage(ctx)) return
+  if (!ctx.from) {
+    console.log('[Telegram] routeUserMessage: no ctx.from, returning')
+    return
+  }
+  if (ctx.chat?.type !== 'private' && !shouldProcessMessage(ctx)) {
+    console.log(`[Telegram] routeUserMessage: not private and shouldProcessMessage=false, chatType=${ctx.chat?.type}, returning`)
+    return
+  }
 
   const chatId = String(ctx.chat.id)
   if (!dedup.tryRecord(`${chatId}:${ctx.message?.message_id}`)) return
@@ -845,6 +851,10 @@ async function collectAttachmentsFromCtx(
 bot.on('message:text', async (ctx) => {
   // 群組訊息去掉 @mention 前綴，避免 AI 看到 @bot_name
   const text = ctx.chat?.type !== 'private' ? stripBotMention(ctx.message.text) : ctx.message.text
+  console.log(`[Telegram] msg chatType=${ctx.chat?.type} from=${ctx.from?.id} mention=${isBotMentioned(ctx)} reply=${isReplyToBot(ctx)} username=${botUsername}`)
+  if (ctx.chat?.type !== 'private') {
+    console.log(`[Telegram] entities=${JSON.stringify(ctx.message.entities)}`)
+  }
   await routeUserMessage(ctx, text, [])
 })
 
