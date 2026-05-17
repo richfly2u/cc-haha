@@ -60,6 +60,8 @@ attachmentStore.gc().catch((err) => {
 
 // Track placeholder messages for streaming updates
 const placeholders = new Map<string, { chatId: string; messageId: number }>()
+// Track thinking message count per chat (for varied thinking messages)
+const thinkingCount = new Map<string, number>()
 // Track accumulated text per chat for streaming
 const accumulatedText = new Map<string, string>()
 // Message buffers per chat
@@ -215,6 +217,13 @@ async function flushToTelegram(chatId: string, newText: string, isComplete: bool
 
   if (placeholder) {
     if (isComplete) {
+      try {
+        // 如果有多次思考，在顯示最終文字前先更新為「快完成思考」
+        const tc = thinkingCount.get(chatId) ?? 0
+        if (tc > 1) {
+          await bot.api.editMessageText(numericChatId, placeholder.messageId, '💭 快完成思考...')
+        }
+      } catch { /* ignore */ }
       const chunks = splitMessage(fullText, TELEGRAM_TEXT_LIMIT)
       try {
         await bot.api.editMessageText(numericChatId, placeholder.messageId, chunks[0]!)
@@ -236,6 +245,7 @@ async function flushToTelegram(chatId: string, newText: string, isComplete: bool
   if (isComplete) {
     placeholders.delete(chatId)
     accumulatedText.delete(chatId)
+    thinkingCount.delete(chatId)
     buffers.get(chatId)?.reset()
   }
 }
@@ -367,10 +377,15 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
     case 'status':
       runtime.state = msg.state
       runtime.verb = typeof msg.verb === 'string' ? msg.verb : undefined
-      if (msg.state === 'thinking' && !placeholders.has(chatId)) {
-        const sent = await bot.api.sendMessage(numericChatId, '💭 思考中...')
-        placeholders.set(chatId, { chatId, messageId: sent.message_id })
-        accumulatedText.set(chatId, '')
+      if (msg.state === 'thinking') {
+        const count = (thinkingCount.get(chatId) ?? 0) + 1
+        thinkingCount.set(chatId, count)
+        // 只在第一次思考時顯示「思考中」，後續思考不發新訊息避免洗版
+        if (count === 1) {
+          const sent = await bot.api.sendMessage(numericChatId, '💭 思考中...')
+          placeholders.set(chatId, { chatId, messageId: sent.message_id })
+          accumulatedText.set(chatId, '')
+        }
       }
       break
 
@@ -395,6 +410,7 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
           }
           placeholders.delete(chatId)
           accumulatedText.delete(chatId)
+          thinkingCount.delete(chatId)
           buffers.get(chatId)?.reset()
         }
       }
@@ -465,6 +481,7 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
         }
         placeholders.delete(chatId)
         accumulatedText.delete(chatId)
+        thinkingCount.delete(chatId)
         buffers.get(chatId)?.reset()
       }
       break
