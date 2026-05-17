@@ -223,10 +223,8 @@ async function flushToTelegram(chatId: string, newText: string, isComplete: bool
         await bot.api.sendMessage(numericChatId, chunks[i]!)
       }
     } else {
-      const displayText = fullText.slice(0, TELEGRAM_TEXT_LIMIT - 2) + ' ▍'
-      try {
-        await bot.api.editMessageText(numericChatId, placeholder.messageId, displayText)
-      } catch { /* ignore */ }
+      // 不編輯已發送的訊息，避免逐詞閃爍（跑馬燈效果）
+      // 文字會累積在 accumulatedText 中，待完整時一次寫入
     }
   } else if (isComplete && fullText.trim()) {
     const chunks = splitMessage(fullText, TELEGRAM_TEXT_LIMIT)
