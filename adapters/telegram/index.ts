@@ -60,6 +60,12 @@ attachmentStore.gc().catch((err) => {
 
 // Track placeholder messages for streaming updates
 const placeholders = new Map<string, { chatId: string; messageId: number }>()
+// Track thinking message count per chat (for varied thinking messages)
+const thinkingCount = new Map<string, number>()
+// 20秒耐心等候定時器，避免使用者以為機器人沒在動
+const patienceTimers = new Map<string, ReturnType<typeof setTimeout>>()
+// Bot username (populated after bot.start()), used for @mention detection in groups
+let botUsername: string | null = null
 // Track accumulated text per chat for streaming
 const accumulatedText = new Map<string, string>()
 // Message buffers per chat
@@ -85,6 +91,51 @@ type ChatRuntimeState = {
   verb?: string
   model?: string
   pendingPermissionCount: number
+}
+
+// ---------- group chat helpers ----------
+
+/** Check if ctx.message contains an @mention of this bot. */
+function isBotMentioned(ctx: Context): boolean {
+  if (!botUsername || !ctx.message?.text || !ctx.message.entities) return false
+  const mentionTag = `@${botUsername.toLowerCase()}`
+  for (const entity of ctx.message.entities) {
+    if (entity.type === 'mention') {
+      const mention = ctx.message.text.slice(entity.offset, entity.offset + entity.length).toLowerCase()
+      if (mention === mentionTag) return true
+    }
+  }
+  return false
+}
+
+/** Check if ctx.message is a reply to a message sent by this bot. */
+function isReplyToBot(ctx: Context): boolean {
+  const reply = ctx.message?.reply_to_message
+  if (!reply || !reply.from) return false
+  return reply.from.id === bot.botInfo?.id
+}
+
+/** Determine if the bot should process a message in the current chat context. */
+function shouldProcessMessage(ctx: Context): boolean {
+  if (ctx.chat?.type === 'private') return true
+  return isBotMentioned(ctx) || isReplyToBot(ctx)
+}
+
+/** Strip bot @mention prefix from text and trim. Also handles /command@bot syntax. */
+function stripBotMention(text: string): string {
+  if (!botUsername) return text
+  const mentionTag = `@${botUsername}`
+  let clean = text
+  // Remove @mention prefix if present (e.g., "@bot_name query" or "@bot_name /command")
+  if (clean.startsWith(`${mentionTag} `) || clean === mentionTag) {
+    clean = clean.slice(mentionTag.length).trim()
+  }
+  // Handle /command@botUsername syntax
+  const cmdMatch = clean.match(/^\/(\w+)@(\w+)(.*)/)
+  if (cmdMatch) {
+    clean = `/${cmdMatch[1]}${cmdMatch[3] || ''}`.trim()
+  }
+  return clean
 }
 
 // ---------- helpers ----------
@@ -215,6 +266,13 @@ async function flushToTelegram(chatId: string, newText: string, isComplete: bool
 
   if (placeholder) {
     if (isComplete) {
+      try {
+        // 如果有多次思考，在顯示最終文字前先更新為「快完成思考」
+        const tc = thinkingCount.get(chatId) ?? 0
+        if (tc > 1) {
+          await bot.api.editMessageText(numericChatId, placeholder.messageId, '💭 快完成思考...')
+        }
+      } catch { /* ignore */ }
       const chunks = splitMessage(fullText, TELEGRAM_TEXT_LIMIT)
       try {
         await bot.api.editMessageText(numericChatId, placeholder.messageId, chunks[0]!)
@@ -223,10 +281,8 @@ async function flushToTelegram(chatId: string, newText: string, isComplete: bool
         await bot.api.sendMessage(numericChatId, chunks[i]!)
       }
     } else {
-      const displayText = fullText.slice(0, TELEGRAM_TEXT_LIMIT - 2) + ' ▍'
-      try {
-        await bot.api.editMessageText(numericChatId, placeholder.messageId, displayText)
-      } catch { /* ignore */ }
+      // 不編輯已發送的訊息，避免逐詞閃爍（跑馬燈效果）
+      // 文字會累積在 accumulatedText 中，待完整時一次寫入
     }
   } else if (isComplete && fullText.trim()) {
     const chunks = splitMessage(fullText, TELEGRAM_TEXT_LIMIT)
@@ -236,8 +292,11 @@ async function flushToTelegram(chatId: string, newText: string, isComplete: bool
   }
 
   if (isComplete) {
+    clearTimeout(patienceTimers.get(chatId))
+    patienceTimers.delete(chatId)
     placeholders.delete(chatId)
     accumulatedText.delete(chatId)
+    // 注意：不刪 thinkingCount — 讓它在整個回應過程中持續累計
     buffers.get(chatId)?.reset()
   }
 }
@@ -369,10 +428,34 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
     case 'status':
       runtime.state = msg.state
       runtime.verb = typeof msg.verb === 'string' ? msg.verb : undefined
-      if (msg.state === 'thinking' && !placeholders.has(chatId)) {
-        const sent = await bot.api.sendMessage(numericChatId, '💭 思考中...')
-        placeholders.set(chatId, { chatId, messageId: sent.message_id })
-        accumulatedText.set(chatId, '')
+      if (msg.state === 'thinking') {
+        const count = (thinkingCount.get(chatId) ?? 0) + 1
+        thinkingCount.set(chatId, count)
+        // 只在第一次思考時顯示「思考中」，後續思考不發新訊息避免洗版
+        if (count === 1) {
+          const sent = await bot.api.sendMessage(numericChatId, '💭 思考中...')
+          placeholders.set(chatId, { chatId, messageId: sent.message_id })
+          accumulatedText.set(chatId, '')
+          // 10秒 → 還在思考中；20秒 → 請耐心等候
+          clearTimeout(patienceTimers.get(chatId))
+          let elapsed = 0
+          const updatePatience = () => {
+            elapsed += 10
+            const ph = placeholders.get(chatId)
+            if (!ph) return
+            const messages: Record<number, string> = {
+              10: '💭 還在思考中...',
+              20: '💭 請耐心等候，可能需要較長時間思考...',
+            }
+            if (messages[elapsed]) {
+              bot.api.editMessageText(numericChatId, ph.messageId, messages[elapsed]!).catch(() => {})
+            }
+            if (elapsed < 20) {
+              patienceTimers.set(chatId, setTimeout(updatePatience, 10000))
+            }
+          }
+          patienceTimers.set(chatId, setTimeout(updatePatience, 10000))
+        }
       }
       break
 
@@ -397,6 +480,9 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
           }
           placeholders.delete(chatId)
           accumulatedText.delete(chatId)
+          // 不刪 thinkingCount — 讓它在整個回應過程中持續累計
+          clearTimeout(patienceTimers.get(chatId))
+          patienceTimers.delete(chatId)
           buffers.get(chatId)?.reset()
         }
       }
@@ -467,6 +553,9 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
         }
         placeholders.delete(chatId)
         accumulatedText.delete(chatId)
+        thinkingCount.delete(chatId)
+        clearTimeout(patienceTimers.get(chatId))
+        patienceTimers.delete(chatId)
         buffers.get(chatId)?.reset()
       }
       break
@@ -515,8 +604,14 @@ async function sendHelp(ctx: Context): Promise<void> {
   await ctx.reply(`👋 Claude Code Bot 已就绪。\n\n${formatImHelp()}`)
 }
 
-bot.command('start', (ctx) => void sendHelp(ctx))
-bot.command('help', (ctx) => void sendHelp(ctx))
+bot.command('start', (ctx) => {
+  if (!shouldProcessMessage(ctx)) return
+  void sendHelp(ctx)
+})
+bot.command('help', (ctx) => {
+  if (!shouldProcessMessage(ctx)) return
+  void sendHelp(ctx)
+})
 
 /** Reset session state and start a new session for chatId.
  *  If `query` is provided, match a project by index or name;
@@ -570,16 +665,19 @@ async function startNewSession(chatId: string, query?: string): Promise<void> {
 }
 
 bot.command('new', async (ctx) => {
+  if (!shouldProcessMessage(ctx)) return
   const chatId = String(ctx.chat.id)
   await startNewSession(chatId, ctx.match?.trim() || undefined)
 })
 
 bot.command('projects', async (ctx) => {
+  if (!shouldProcessMessage(ctx)) return
   const chatId = String(ctx.chat.id)
   await showProjectPicker(chatId)
 })
 
 bot.command('stop', (ctx) => {
+  if (!shouldProcessMessage(ctx)) return
   const chatId = String(ctx.chat.id)
   void (async () => {
     const stored = await ensureExistingSession(chatId)
@@ -593,11 +691,13 @@ bot.command('stop', (ctx) => {
 })
 
 bot.command('status', async (ctx) => {
+  if (!shouldProcessMessage(ctx)) return
   const chatId = String(ctx.chat.id)
   await ctx.reply(await buildStatusText(chatId))
 })
 
 bot.command('clear', (ctx) => {
+  if (!shouldProcessMessage(ctx)) return
   const chatId = String(ctx.chat.id)
   void (async () => {
     const stored = await ensureExistingSession(chatId)
@@ -629,10 +729,11 @@ async function routeUserMessage(
   text: string,
   attachments: AttachmentRef[],
 ): Promise<void> {
-  if (!ctx.from || ctx.chat?.type !== 'private') return
-  if (!dedup.tryRecord(String(ctx.message?.message_id))) return
+  if (!ctx.from) return
+  if (ctx.chat?.type !== 'private' && !shouldProcessMessage(ctx)) return
 
   const chatId = String(ctx.chat.id)
+  if (!dedup.tryRecord(`${chatId}:${ctx.message?.message_id}`)) return
   const userId = ctx.from.id
 
   if (!isAllowedUser('telegram', userId)) {
@@ -742,13 +843,24 @@ async function collectAttachmentsFromCtx(
 }
 
 bot.on('message:text', async (ctx) => {
-  await routeUserMessage(ctx, ctx.message.text, [])
+  // 群組訊息去掉 @mention 前綴，避免 AI 看到 @bot_name
+  const text = ctx.chat?.type !== 'private' ? stripBotMention(ctx.message.text) : ctx.message.text
+  // Debug: 在群組先回覆測試訊息，確認 handler 有被觸發
+  if (ctx.chat?.type !== 'private') {
+    const mentioned = isBotMentioned(ctx)
+    const replied = isReplyToBot(ctx)
+    const entities = JSON.stringify(ctx.message.entities)
+    await ctx.reply(
+      `📋 Debug:\nchatType=${ctx.chat.type}\nmention=${mentioned}\nreply=${replied}\nentities=${entities}\nusername=${botUsername}\ntext="${ctx.message.text}"`,
+    ).catch(() => {})
+  }
+  await routeUserMessage(ctx, text, [])
 })
 
 bot.on(
   ['message:photo', 'message:document', 'message:video', 'message:audio', 'message:voice'],
   async (ctx) => {
-    const caption = ctx.message.caption ?? ''
+    const caption = ctx.chat?.type !== 'private' ? stripBotMention(ctx.message.caption ?? '') : (ctx.message.caption ?? '')
     const { attachments, rejections } = await collectAttachmentsFromCtx(ctx)
     for (const r of rejections) {
       await ctx.reply(r).catch(() => {})
@@ -788,7 +900,10 @@ console.log(`[Telegram] Server: ${config.serverUrl}`)
 console.log(`[Telegram] Allowed users: ${config.telegram.allowedUsers.length === 0 ? 'all' : config.telegram.allowedUsers.join(', ')}`)
 
 bot.start({
-  onStart: () => console.log('[Telegram] Bot is running!'),
+  onStart: () => {
+    botUsername = bot.botInfo.username
+    console.log('[Telegram] Bot is running!')
+  },
 })
 
 // Graceful shutdown
